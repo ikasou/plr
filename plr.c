@@ -1525,7 +1525,7 @@ plr_convertargs(plr_function *function, Datum *arg, bool *argnull, FunctionCallI
 			else if (function->arg_is_rel[i])
 			{
 				/* for tuple args, convert to a one row data.frame */
-				CONVERT_TUPLE_TO_DATAFRAME;
+				CONVERT_TUPLE_TO_DATAFRAME(arg[i]);
 			}
 			else if (function->arg_elem[i] == InvalidOid)
 			{
@@ -1568,11 +1568,9 @@ plr_convertargs(plr_function *function, Datum *arg, bool *argnull, FunctionCallI
 			}
 			else if (function->arg_is_rel[i])
 			{
-				/* keep compiler quiet */
-				el = R_NilValue;
-
-				elog(ERROR, "Tuple arguments not supported in PL/R Window Functions");
-			}
+                /* for tuple args, convert to a one row data.frame */
+                CONVERT_TUPLE_TO_DATAFRAME(dvalue);
+ 			}
 			else if (function->arg_elem[i] == InvalidOid)
 			{
 				/* for scalar args, convert to a one row vector */
@@ -1617,13 +1615,44 @@ plr_convertargs(plr_function *function, Datum *arg, bool *argnull, FunctionCallI
 			bool			has_nulls;
 
 			WinGetFrameData(winobj, i, dvalues, isnulls, &numels, &has_nulls);
-
-			datum_typid = function->arg_typid[i];
-			datum_out_func = function->arg_out_func[i];
-			datum_typbyval = function->arg_typbyval[i];
-			PROTECT(el = pg_datum_array_get_r(dvalues, isnulls, numels, has_nulls,
+            
+            if (!function->arg_is_rel[i])
+            {
+                datum_typid = function->arg_typid[i];
+                datum_out_func = function->arg_out_func[i];
+                datum_typbyval = function->arg_typbyval[i];
+                PROTECT(el = pg_datum_array_get_r(dvalues, isnulls, numels, has_nulls,
 											  datum_typid, datum_out_func, datum_typbyval));
 
+            }
+            else
+            {
+                /* for tuple args, convert to a multi-row data.frame */
+                int          tpl;
+                int32        tupTypmod;
+                TupleDesc    tupdesc;
+                HeapTupleHeader tuple_hdr;
+                HeapTupleData  *tupledata = palloc0(numels * sizeof(HeapTupleData));
+                HeapTuple      *tuples = palloc0(numels * sizeof(HeapTuple));
+                for (tpl = 0; tpl < numels; tpl++)
+                {
+                    tuple_hdr = DatumGetHeapTupleHeader(dvalues[tpl]);
+                    tupledata[tpl].t_len = HeapTupleHeaderGetDatumLength(tuple_hdr);
+                    ItemPointerSetInvalid(&tupledata[tpl].t_self);
+                    tupledata[tpl].t_tableOid = InvalidOid;
+                    tupledata[tpl].t_data = tuple_hdr;
+                    tuples[tpl] = &tupledata[tpl];
+                }
+                /* Get tupdesc from first tuple **assuming all are the same type** */
+                tuple_hdr = DatumGetHeapTupleHeader(dvalues[0]);
+                datum_typid = HeapTupleHeaderGetTypeId(tuple_hdr);
+                tupTypmod = HeapTupleHeaderGetTypMod(tuple_hdr);
+                tupdesc = lookup_rowtype_tupdesc(datum_typid, tupTypmod);
+                PROTECT(el = pg_tuple_get_r_frame(numels, tuples, tupdesc));
+                ReleaseTupleDesc(tupdesc);
+                pfree(tuples);
+                pfree(tupledata);
+            }
 			/*
 			 * We already set function->nargs arguments
 			 * so we must start with a function->nargs

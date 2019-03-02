@@ -365,13 +365,13 @@ extern void R_RunExitFinalizers(void);
 		arg[7] = PointerGetDatum(dtrigtup); \
 		argnull[7] = false; \
 	} while (0)
-#define CONVERT_TUPLE_TO_DATAFRAME \
+#define CONVERT_TUPLE_TO_DATAFRAME(t) \
 	do { \
 		Oid			tupType; \
 		int32		tupTypmod; \
 		TupleDesc	tupdesc; \
 		HeapTuple	tuple = palloc(sizeof(HeapTupleData)); \
-		HeapTupleHeader	tuple_hdr = DatumGetHeapTupleHeader(arg[i]); \
+		HeapTupleHeader	tuple_hdr = DatumGetHeapTupleHeader(t); \
 		tupType = HeapTupleHeaderGetTypeId(tuple_hdr); \
 		tupTypmod = HeapTupleHeaderGetTypMod(tuple_hdr); \
 		tupdesc = lookup_rowtype_tupdesc(tupType, tupTypmod); \
