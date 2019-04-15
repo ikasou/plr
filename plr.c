@@ -183,13 +183,26 @@ static plr_function *do_compile(FunctionCallInfo fcinfo,
 								plr_func_hashkey *hashkey);
 static void plr_protected_parse(void* data);
 static SEXP plr_parse_func_body(const char *body);
-static SEXP plr_convertargs(plr_function *function, Datum *arg, bool *argnull, FunctionCallInfo fcinfo);
+#if (PG_VERSION_NUM >= 120000)
+static SEXP plr_convertargs(plr_function *function, NullableDatum *args, FunctionCallInfo fcinfo, SEXP rho);
+#else
+static SEXP plr_convertargs(plr_function *function, Datum *arg, bool *argnull, FunctionCallInfo fcinfo, SEXP rho);
+#endif
 static void plr_error_callback(void *arg);
 static Oid getNamespaceOidFromFunctionOid(Oid fnOid);
 static bool haveModulesTable(Oid nspOid);
 static char *getModulesSql(Oid nspOid);
 #ifdef HAVE_WINDOW_FUNCTIONS
-static void WinGetFrameData(WindowObject winobj, int argno, Datum *dvalues, bool *isnull, int *numels, bool *has_nulls);
+// See full definition in src/backend/executor/nodeWindowAgg.c
+typedef struct WindowObjectData
+{
+	NodeTag		type;
+	WindowAggState *winstate;	/* parent WindowAggState */
+} WindowObjectData;
+static const char PLR_WINDOW_FRAME_NAME[] = "plr_window_frame";
+#define PLR_WINDOW_ENV_NAME_MAX_LENGTH 30
+static const char PLR_WINDOW_ENV_PATTERN[] = "window_env_%p";
+static bool plr_is_unbound_frame(WindowObject winobj);
 #endif
 static void plr_resolve_polymorphic_argtypes(int numargs,
 											 Oid *argtypes, char *argmodes,
@@ -408,6 +421,25 @@ plr_init(void)
 	plr_pm_init_done = true;
 }
 
+#ifdef HAVE_WINDOW_FUNCTIONS
+/*
+ * plr_is_unbound_frame - return true if window function frame is unbound, i.e. whole partition
+ */
+static bool
+plr_is_unbound_frame(WindowObject winobj)
+{
+	WindowAgg*			node		 = (WindowAgg *)winobj->winstate->ss.ps.plan;
+	int					frameOptions = winobj->winstate->frameOptions;
+	static const int	unbound_mask = FRAMEOPTION_START_UNBOUNDED_PRECEDING | FRAMEOPTION_END_UNBOUNDED_FOLLOWING;
+
+	return
+#if PG_VERSION_NUM >= 110000
+		0 == (frameOptions & (FRAMEOPTION_GROUPS | FRAMEOPTION_EXCLUDE_CURRENT_ROW | FRAMEOPTION_EXCLUDE_GROUP | FRAMEOPTION_EXCLUDE_TIES)) &&
+#endif
+		((0 == node->ordNumCols && frameOptions & FRAMEOPTION_RANGE) || unbound_mask == (frameOptions & unbound_mask));
+}
+#endif
+
 /*
  * plr_load_builtins() - load "builtin" PL/R functions into R interpreter
  */
@@ -593,8 +625,12 @@ plr_trigger_handler(PG_FUNCTION_ARGS)
 	SEXP			rargs;
 	SEXP			rvalue;
 	Datum			retval;
-	Datum			arg[FUNC_MAX_ARGS];
-	bool			argnull[FUNC_MAX_ARGS];
+#if (PG_VERSION_NUM >= 120000)
+	NullableDatum  args[sizeof(NullableDatum) * FUNC_MAX_ARGS];
+#else
+	Datum arg[FUNC_MAX_ARGS];
+    bool argnull[FUNC_MAX_ARGS];
+#endif
 	TriggerData	   *trigdata = (TriggerData *) fcinfo->context;
 	TupleDesc		tupdesc = trigdata->tg_relation->rd_att;
 	Datum		   *dvalues;
@@ -624,61 +660,56 @@ plr_trigger_handler(PG_FUNCTION_ARGS)
 	 * are mostly hardwired in advance
 	 */
 	/* first is trigger name */
-	arg[0] = DirectFunctionCall1(textin,
-				 CStringGetDatum(trigdata->tg_trigger->tgname));
-	argnull[0] = false;
+	SET_ARG(DirectFunctionCall1(textin,
+				 CStringGetDatum(trigdata->tg_trigger->tgname)),false,0);
 
 	/* second is trigger relation oid */
-	arg[1] = ObjectIdGetDatum(trigdata->tg_relation->rd_id);
-	argnull[1] = false;
+	SET_ARG(ObjectIdGetDatum(trigdata->tg_relation->rd_id),false,1);
 
 	/* third is trigger relation name */
-	arg[2] = DirectFunctionCall1(textin,
-				 CStringGetDatum(get_rel_name(trigdata->tg_relation->rd_id)));
-	argnull[2] = false;
+	SET_ARG(DirectFunctionCall1(textin,
+				 CStringGetDatum(get_rel_name(trigdata->tg_relation->rd_id))),false,2);
 
 	/* fourth is when trigger fired, i.e. BEFORE or AFTER */
 	if (TRIGGER_FIRED_BEFORE(trigdata->tg_event))
-		arg[3] = DirectFunctionCall1(textin,
-				 CStringGetDatum("BEFORE"));
+		SET_ARG(DirectFunctionCall1(textin,
+				 CStringGetDatum("BEFORE")),false,3);
 	else if (TRIGGER_FIRED_AFTER(trigdata->tg_event))
-		arg[3] = DirectFunctionCall1(textin,
-				 CStringGetDatum("AFTER"));
+		SET_ARG(DirectFunctionCall1(textin,
+				 CStringGetDatum("AFTER")),false,3);
 	else
 		/* internal error */
 		elog(ERROR, "unrecognized tg_event");
-	argnull[3] = false;
+
 
 	/*
 	 * fifth is level trigger fired, i.e. ROW or STATEMENT
 	 * sixth is operation that fired trigger, i.e. INSERT, UPDATE, or DELETE
-	 * seventh is NEW, eigth is OLD
+	 * seventh is NEW, eighth is OLD
 	 */
 	if (TRIGGER_FIRED_FOR_STATEMENT(trigdata->tg_event))
 	{
-		arg[4] = DirectFunctionCall1(textin,
-				 CStringGetDatum("STATEMENT"));
+		SET_ARG(DirectFunctionCall1(textin,
+				 CStringGetDatum("STATEMENT")),false,4);
 
 		if (TRIGGER_FIRED_BY_INSERT(trigdata->tg_event))
-			arg[5] = DirectFunctionCall1(textin, CStringGetDatum("INSERT"));
+			SET_ARG(DirectFunctionCall1(textin, CStringGetDatum("INSERT")),false,5);
 		else if (TRIGGER_FIRED_BY_DELETE(trigdata->tg_event))
-			arg[5] = DirectFunctionCall1(textin, CStringGetDatum("DELETE"));
+			SET_ARG(DirectFunctionCall1(textin, CStringGetDatum("DELETE")),false,5);
 		else if (TRIGGER_FIRED_BY_UPDATE(trigdata->tg_event))
-			arg[5] = DirectFunctionCall1(textin, CStringGetDatum("UPDATE"));
+			SET_ARG(DirectFunctionCall1(textin, CStringGetDatum("UPDATE")),false,5);
 		else
 			/* internal error */
 			elog(ERROR, "unrecognized tg_event");
 
-		arg[6] = (Datum) 0;
-		argnull[6] = true;
+		SET_ARG((Datum) 0,true,6);
+		SET_ARG((Datum) 0,true,7);
 
-		arg[7] = (Datum) 0;
-		argnull[7] = true;
 	}
 	else if (TRIGGER_FIRED_FOR_ROW(trigdata->tg_event))
 	{
-		arg[4] = DirectFunctionCall1(textin,
-				 CStringGetDatum("ROW"));
+		SET_ARG(DirectFunctionCall1(textin,
+				 CStringGetDatum("ROW")),false,4);
 
 		if (TRIGGER_FIRED_BY_INSERT(trigdata->tg_event))
 			SET_INSERT_ARGS_567;
@@ -694,8 +725,6 @@ plr_trigger_handler(PG_FUNCTION_ARGS)
 		/* internal error */
 		elog(ERROR, "unrecognized tg_event");
 
-	argnull[4] = false;
-	argnull[5] = false;
 
 	/*
 	 * finally, ninth argument is a text array of trigger arguments
@@ -709,8 +738,7 @@ plr_trigger_handler(PG_FUNCTION_ARGS)
 	array = construct_md_array(dvalues, NULL, ndims, dims, lbs,
 								TEXTOID, -1, false, 'i');
 
-	arg[8] = PointerGetDatum(array);
-	argnull[8] = false;
+	SET_ARG(PointerGetDatum(array),false,8);
 
 	/*
 	 * All done building args; from this point it is just like
@@ -720,10 +748,13 @@ plr_trigger_handler(PG_FUNCTION_ARGS)
 	PROTECT(fun = function->fun);
 
 	/* Convert all call arguments */
-	PROTECT(rargs = plr_convertargs(function, arg, argnull, fcinfo));
-
+#if (PG_VERSION_NUM >= 120000)
+	PROTECT(rargs = plr_convertargs(function, args, fcinfo, R_NilValue));
+#else
+	PROTECT(rargs = plr_convertargs(function, arg, argnull, fcinfo, R_NilValue));
+#endif
 	/* Call the R function */
-	PROTECT(rvalue = call_r_func(fun, rargs));
+	PROTECT(rvalue = call_r_func(fun, rargs, R_GlobalEnv));
 
 	/*
 	 * Convert the return value from an R object to a Datum.
@@ -744,9 +775,16 @@ plr_func_handler(PG_FUNCTION_ARGS)
 {
 	plr_function  *function;
 	SEXP			fun;
+	SEXP			env = R_GlobalEnv;
 	SEXP			rargs;
 	SEXP			rvalue;
 	Datum			retval;
+#ifdef HAVE_WINDOW_FUNCTIONS
+	WindowObject	winobj;
+	char			internal_env[PLR_WINDOW_ENV_NAME_MAX_LENGTH];
+	int64			current_row;
+	int				check_err;
+#endif
 	ERRORCONTEXTCALLBACK;
 
 	/* Find or compile the function */
@@ -757,11 +795,45 @@ plr_func_handler(PG_FUNCTION_ARGS)
 
 	PROTECT(fun = function->fun);
 
-	/* Convert all call arguments */
-	PROTECT(rargs = plr_convertargs(function, fcinfo->arg, fcinfo->argnull, fcinfo));
+#ifdef HAVE_WINDOW_FUNCTIONS
+	if (function->iswindow)
+	{
+		winobj = PG_WINDOW_OBJECT();
+		current_row = WinGetCurrentPosition(winobj);
 
+		sprintf(internal_env, PLR_WINDOW_ENV_PATTERN, winobj);
+		if (0 == current_row)
+		{
+			env = R_tryEval(lang2(install("new.env"), R_GlobalEnv), R_GlobalEnv, &check_err);
+			if (check_err)
+				elog(ERROR, "Failed to create new environment \"%s\" for window function calls.", internal_env);
+			defineVar(install(internal_env), env, R_GlobalEnv);
+		}
+		else
+		{
+			env = findVar(install(internal_env), R_GlobalEnv);
+			if (R_UnboundValue == env)
+				elog(ERROR, "%s window frame environment cannot be found in R_GlobalEnv", internal_env);
+		}
+	}
+#endif
+
+	/* Convert all call arguments */
+#if (PG_VERSION_NUM >= 120000)
+	PROTECT(rargs = plr_convertargs(function, fcinfo->args, fcinfo, env));
+#else
+	PROTECT(rargs = plr_convertargs(function, fcinfo->arg, fcinfo->argnull,  fcinfo, env));
+
+#endif
 	/* Call the R function */
-	PROTECT(rvalue = call_r_func(fun, rargs));
+	PROTECT(rvalue = call_r_func(fun, rargs, env));
+
+#ifdef HAVE_WINDOW_FUNCTIONS
+	/* We should remove window_env_XXX environment along with frame data list after last call */
+	if (function->iswindow && plr_is_unbound_frame(winobj)
+		&& WinGetPartitionRowCount(winobj) == current_row + 1)
+		R_tryEval(lang2(install("rm"), install(internal_env)), R_GlobalEnv, &check_err);
+#endif
 
 	/*
 	 * Convert the return value from an R object to a Datum.
@@ -1450,7 +1522,7 @@ plr_parse_func_body(const char *body)
 }
 
 SEXP
-call_r_func(SEXP fun, SEXP rargs)
+call_r_func(SEXP fun, SEXP rargs, SEXP rho)
 {
 	int		errorOccurred;
 	SEXP	call,
@@ -1461,7 +1533,7 @@ call_r_func(SEXP fun, SEXP rargs)
          * function we're calling.
          */
 	PROTECT(call = Rf_lcons(fun, rargs));
-	ans = R_tryEval(call, R_GlobalEnv, &errorOccurred);
+	ans = R_tryEval(call, rho, &errorOccurred);
 	UNPROTECT(1);
 
 	if(errorOccurred)
@@ -1479,8 +1551,13 @@ call_r_func(SEXP fun, SEXP rargs)
 	return ans;
 }
 
+#if (PG_VERSION_NUM >= 120000)
 static SEXP
-plr_convertargs(plr_function *function, Datum *arg, bool *argnull, FunctionCallInfo fcinfo)
+plr_convertargs(plr_function *function, NullableDatum *args, FunctionCallInfo fcinfo, SEXP rho)
+#else
+static SEXP
+plr_convertargs(plr_function *function, Datum *arg, bool *argnull, FunctionCallInfo fcinfo, SEXP rho)
+#endif
 {
 	int		i;
 	int		m = 1;
@@ -1517,7 +1594,7 @@ plr_convertargs(plr_function *function, Datum *arg, bool *argnull, FunctionCallI
 		if (!function->iswindow)
 		{
 #endif
-			if (argnull[i])
+			if (IS_ARG_NULL(i))
 			{
 				/* fast track for null arguments */
 				PROTECT(el = R_NilValue);
@@ -1530,7 +1607,7 @@ plr_convertargs(plr_function *function, Datum *arg, bool *argnull, FunctionCallI
 			else if (function->arg_elem[i] == InvalidOid)
 			{
 				/* for scalar args, convert to a one row vector */
-				Datum		dvalue = arg[i];
+				Datum		dvalue = GET_ARG_VALUE(i);
 				Oid			arg_typid = function->arg_typid[i];
 				FmgrInfo	arg_out_func = function->arg_out_func[i];
 
@@ -1539,7 +1616,7 @@ plr_convertargs(plr_function *function, Datum *arg, bool *argnull, FunctionCallI
 			else
 			{
 				/* better be a pg array arg, convert to a multi-row vector */
-				Datum		dvalue = (Datum) PG_DETOAST_DATUM(arg[i]);
+				Datum		dvalue = (Datum) PG_DETOAST_DATUM(GET_ARG_VALUE(i));
 				FmgrInfo	out_func = function->arg_elem_out_func[i];
 				int			typlen = function->arg_elem_typlen[i];
 				bool		typbyval = function->arg_elem_typbyval[i];
@@ -1602,18 +1679,13 @@ plr_convertargs(plr_function *function, Datum *arg, bool *argnull, FunctionCallI
 	if (function->iswindow)
 	{
 		WindowObject	winobj = PG_WINDOW_OBJECT();
-		int64			totalrows = WinGetPartitionRowCount(winobj);
-		int				numels = 0;
+		int64			current_row = WinGetCurrentPosition(winobj);
+		int				numels;
 
-		for (i = 0; i < function->nargs; i++)
+		if (plr_is_unbound_frame(winobj))
 		{
-			Datum		   *dvalues = palloc0(totalrows * sizeof(Datum));
-			bool		   *isnulls = palloc0(totalrows * sizeof(bool));
-			Oid				datum_typid;
-			FmgrInfo		datum_out_func;
-			bool			datum_typbyval;
-			bool			has_nulls;
 
+/*<<<<<<< HEAD
 			WinGetFrameData(winobj, i, dvalues, isnulls, &numels, &has_nulls);
             
             if (!function->arg_is_rel[i])
@@ -1627,7 +1699,7 @@ plr_convertargs(plr_function *function, Datum *arg, bool *argnull, FunctionCallI
             }
             else
             {
-                /* for tuple args, convert to a multi-row data.frame */
+                * for tuple args, convert to a multi-row data.frame *
                 int          tpl;
                 int32        tupTypmod;
                 TupleDesc    tupdesc;
@@ -1643,7 +1715,7 @@ plr_convertargs(plr_function *function, Datum *arg, bool *argnull, FunctionCallI
                     tupledata[tpl].t_data = tuple_hdr;
                     tuples[tpl] = &tupledata[tpl];
                 }
-                /* Get tupdesc from first tuple **assuming all are the same type** */
+                * Get tupdesc from first tuple **assuming all are the same type** *
                 tuple_hdr = DatumGetHeapTupleHeader(dvalues[0]);
                 datum_typid = HeapTupleHeaderGetTypeId(tuple_hdr);
                 tupTypmod = HeapTupleHeaderGetTypMod(tuple_hdr);
@@ -1653,22 +1725,58 @@ plr_convertargs(plr_function *function, Datum *arg, bool *argnull, FunctionCallI
                 pfree(tuples);
                 pfree(tupledata);
             }
-			/*
+			 *
 			 * We already set function->nargs arguments
 			 * so we must start with a function->nargs
-			 */
+			 *
 			SETCAR(t, el);
 			t = CDR(t);
 
 			UNPROTECT(1);
+=======*/
+			SEXP lst;
+			if (0 == current_row)
+			{
+				lst = PROTECT(allocVector(VECSXP, function->nargs));
+				for (i = 0; i < function->nargs; i++, t = CDR(t))
+				{
+					el = get_fn_expr_arg_stable(fcinfo->flinfo, i) ?
+						R_NilValue : pg_window_frame_get_r(winobj, i, function);
+					SET_VECTOR_ELT(lst, i, el);
+					SETCAR(t, el);
+				}
+				defineVar(install(PLR_WINDOW_FRAME_NAME), lst, rho);
+				UNPROTECT(1);
+			}
+			else
+			{
+				lst = findVar(install(PLR_WINDOW_FRAME_NAME), rho);
+				if (R_UnboundValue == lst)
+					elog(ERROR, "%s list with window frame data cannot be found in R_GlobalEnv", PLR_WINDOW_FRAME_NAME);
+				for (i = 0; i < function->nargs; i++, t = CDR(t))
+				{
+					el = VECTOR_ELT(lst, i);
+					SETCAR(t, el);
+				}
+			}
+/*>>>>>>> 6496bfa431edb2d0a26b494a9de88790bb32844f*/
 		}
+		else
+			for (i = 0; i < function->nargs; i++, t = CDR(t))
+			{
+				el = get_fn_expr_arg_stable(fcinfo->flinfo, i) ?
+					R_NilValue : pg_window_frame_get_r(winobj, i, function);
+				SETCAR(t, el);
+			}
+
+		numels = function->nargs > 0 ? GET_LENGTH(el) : 0;
 
 		/* fnumrows */
 		SETCAR(t, ScalarInteger(numels));
 		t = CDR(t);
 
 		/* prownum */
-		SETCAR(t, ScalarInteger(WinGetCurrentPosition(winobj) + 1));
+		SETCAR(t, ScalarInteger((int)current_row + 1));
 	}
 #endif
 
@@ -1799,54 +1907,6 @@ pg_unprotect(int n, char *fn, int ln)
 	unprotect(n);
 }
 #endif /* DEBUGPROTECT */
-
-#ifdef HAVE_WINDOW_FUNCTIONS
-/*
- * WinGetFrameData
- *		Evaluate a window function's argument expression on a specified
- *		window frame, returning an array of Datums for the frame
- *
- * argno: argument number to evaluate (counted from 0)
- * isnull: output argument, receives isnull status of result
- */
-static void
-WinGetFrameData(WindowObject winobj, int argno, Datum *dvalues, bool *isnulls, int *numels, bool *has_nulls)
-{
-	int64		i = 0;
-
-	*has_nulls = false;
-	for(;;)
-	{
-		Datum	lcl_dvalue;
-		bool	lcl_isnull;
-		bool	isout;
-		bool	set_mark;
-
-		if (i > 0)
-			set_mark = false;
-		else
-			set_mark = true;
-
-		lcl_dvalue = WinGetFuncArgInFrame(winobj, argno, i, WINDOW_SEEK_HEAD,
-										  set_mark, &lcl_isnull, &isout);
-
-		if (!isout)
-		{
-			dvalues[i] = lcl_dvalue;
-			isnulls[i] = lcl_isnull;
-			if (lcl_isnull)
-				*has_nulls = true;
-		}
-		else
-		{
-			*numels = i;
-			break;
-		}
-
-		i++;
-	};
-}
-#endif
 
 /*
  * swiped out of plpgsql pl_comp.c

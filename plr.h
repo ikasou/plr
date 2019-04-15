@@ -317,53 +317,73 @@ extern void R_RunExitFinalizers(void);
 	HeapTuple		tup; \
 	HeapTupleHeader	dnewtup; \
 	HeapTupleHeader	dtrigtup
+
+
+#if (PG_VERSION_NUM >= 120000)
+
+#define SET_ARG(val, null, index) \
+    do { \
+	args[index].value=val; \
+	args[index].isnull =null; \
+    } while (0)
+
+#define IS_ARG_NULL(i) args[i].isnull
+#define GET_ARG_VALUE(i) args[i].value
+
+#else
+
+#define SET_ARG(val, null, index) \
+	do { \
+	arg[index]=val; \
+	argnull[index]=null; \
+	} while (0)
+
+#define IS_ARG_NULL(i) argnull[i]
+#define GET_ARG_VALUE(i) arg[i]
+
+#endif
+
 #define SET_INSERT_ARGS_567 \
 	do { \
-		arg[5] = DirectFunctionCall1(textin, CStringGetDatum("INSERT")); \
+		SET_ARG(DirectFunctionCall1(textin, CStringGetDatum("INSERT")),false,5); \
 		tup = trigdata->tg_trigtuple; \
 		dtrigtup = (HeapTupleHeader) palloc(tup->t_len); \
 		memcpy((char *) dtrigtup, (char *) tup->t_data, tup->t_len); \
 		HeapTupleHeaderSetDatumLength(dtrigtup, tup->t_len); \
 		HeapTupleHeaderSetTypeId(dtrigtup, tupdesc->tdtypeid); \
 		HeapTupleHeaderSetTypMod(dtrigtup, tupdesc->tdtypmod); \
-		arg[6] = PointerGetDatum(dtrigtup); \
-		argnull[6] = false; \
-		arg[7] = (Datum) 0; \
-		argnull[7] = true; \
+		SET_ARG(PointerGetDatum(dtrigtup),false,6); \
+		SET_ARG((Datum)0,true,7); \
 	} while (0)
 #define SET_DELETE_ARGS_567 \
 	do { \
-		arg[5] = DirectFunctionCall1(textin, CStringGetDatum("DELETE")); \
-		arg[6] = (Datum) 0; \
-		argnull[6] = true; \
+		SET_ARG(DirectFunctionCall1(textin, CStringGetDatum("DELETE")),false,5); \
+		SET_ARG((Datum) 0,true,6); \
 		tup = trigdata->tg_trigtuple; \
 		dtrigtup = (HeapTupleHeader) palloc(tup->t_len); \
 		memcpy((char *) dtrigtup, (char *) tup->t_data, tup->t_len); \
 		HeapTupleHeaderSetDatumLength(dtrigtup, tup->t_len); \
 		HeapTupleHeaderSetTypeId(dtrigtup, tupdesc->tdtypeid); \
 		HeapTupleHeaderSetTypMod(dtrigtup, tupdesc->tdtypmod); \
-		arg[7] = PointerGetDatum(dtrigtup); \
-		argnull[7] = false; \
+		SET_ARG(PointerGetDatum(dtrigtup),false,7); \
 	} while (0)
 #define SET_UPDATE_ARGS_567 \
 	do { \
-		arg[5] = DirectFunctionCall1(textin, CStringGetDatum("UPDATE")); \
+		SET_ARG(DirectFunctionCall1(textin, CStringGetDatum("UPDATE")),false,5); \
 		tup = trigdata->tg_newtuple; \
 		dnewtup = (HeapTupleHeader) palloc(tup->t_len); \
 		memcpy((char *) dnewtup, (char *) tup->t_data, tup->t_len); \
 		HeapTupleHeaderSetDatumLength(dnewtup, tup->t_len); \
 		HeapTupleHeaderSetTypeId(dnewtup, tupdesc->tdtypeid); \
 		HeapTupleHeaderSetTypMod(dnewtup, tupdesc->tdtypmod); \
-		arg[6] = PointerGetDatum(dnewtup); \
-		argnull[6] = false; \
+		SET_ARG(PointerGetDatum(dnewtup),false,6); \
 		tup = trigdata->tg_trigtuple; \
 		dtrigtup = (HeapTupleHeader) palloc(tup->t_len); \
 		memcpy((char *) dtrigtup, (char *) tup->t_data, tup->t_len); \
 		HeapTupleHeaderSetDatumLength(dtrigtup, tup->t_len); \
 		HeapTupleHeaderSetTypeId(dtrigtup, tupdesc->tdtypeid); \
 		HeapTupleHeaderSetTypMod(dtrigtup, tupdesc->tdtypmod); \
-		arg[7] = PointerGetDatum(dtrigtup); \
-		argnull[7] = false; \
+		SET_ARG(PointerGetDatum(dtrigtup),false,7); \
 	} while (0)
 #define CONVERT_TUPLE_TO_DATAFRAME(t) \
 	do { \
@@ -371,7 +391,7 @@ extern void R_RunExitFinalizers(void);
 		int32		tupTypmod; \
 		TupleDesc	tupdesc; \
 		HeapTuple	tuple = palloc(sizeof(HeapTupleData)); \
-		HeapTupleHeader	tuple_hdr = DatumGetHeapTupleHeader(t); \
+		HeapTupleHeader	tuple_hdr = DatumGetHeapTupleHeader(GET_ARG_VALUE(i)); \
 		tupType = HeapTupleHeaderGetTypeId(tuple_hdr); \
 		tupTypmod = HeapTupleHeaderGetTypMod(tuple_hdr); \
 		tupdesc = lookup_rowtype_tupdesc(tupType, tupTypmod); \
@@ -511,13 +531,12 @@ PGDLLEXPORT void PLR_CLEANUP;
 PGDLLEXPORT void plr_init(void);
 PGDLLEXPORT void plr_load_modules(void);
 PGDLLEXPORT void load_r_cmd(const char *cmd);
-PGDLLEXPORT SEXP call_r_func(SEXP fun, SEXP rargs);
+PGDLLEXPORT SEXP call_r_func(SEXP fun, SEXP rargs, SEXP rho);
 
 /* argument and return value conversion functions */
 PGDLLEXPORT SEXP pg_scalar_get_r(Datum dvalue, Oid arg_typid, FmgrInfo arg_out_func);
 PGDLLEXPORT SEXP pg_array_get_r(Datum dvalue, FmgrInfo out_func, int typlen, bool typbyval, char typalign);
-PGDLLEXPORT SEXP pg_datum_array_get_r(Datum *elem_values, bool *elem_nulls, int numels, bool has_nulls,
-								 Oid element_type, FmgrInfo out_func, bool typbyval);
+PGDLLEXPORT SEXP pg_window_frame_get_r(WindowObject winobj, int argno, plr_function* function);
 PGDLLEXPORT SEXP pg_tuple_get_r_frame(int ntuples, HeapTuple *tuples, TupleDesc tupdesc);
 PGDLLEXPORT Datum r_get_pg(SEXP rval, plr_function *function, FunctionCallInfo fcinfo);
 PGDLLEXPORT Datum get_datum(SEXP rval, Oid typid, Oid typelem, FmgrInfo in_func, bool *isnull);
